@@ -56,7 +56,7 @@ def setup_hook() -> None:
     extensions = [
         "cogs.general",
         "cogs.admin",
-        "cogs.results"
+        # "cogs.results" Disable the results cog
     ]
 
     for ext in extensions:
