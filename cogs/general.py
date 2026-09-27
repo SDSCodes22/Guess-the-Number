@@ -3,9 +3,10 @@ General cog — Higher or Lower game logic and commands.
 
 Provides the guessthenum slash command group with public, duel,
 and chosen subcommands.  Handles all game state, message listening,
-and result feedback.
+result feedback, and game timeouts.
 """
 
+import asyncio
 import random
 from typing import Optional
 
@@ -45,11 +46,14 @@ class Game:
         channel_id:     Discord channel ID where the game is running.
         active:         Whether the game is still in progress.
         chooser:        User ID of the number picker (chosen mode only).
+        starter_id:     User ID of the person who started the game.
+        timeout_task:   Asyncio task handling the inactivity timeout.
     """
 
     __slots__ = (
         "mode", "target", "min_val", "max_val", "players",
         "current_turn_idx", "channel_id", "active", "chooser",
+        "starter_id", "timeout_task",
     )
 
     def __init__(
@@ -60,6 +64,7 @@ class Game:
         max_val: int,
         players: list[int],
         channel_id: int,
+        starter_id: int,
         chooser: Optional[int] = None,
     ) -> None:
         """Initialise a new Game instance."""
@@ -72,6 +77,8 @@ class Game:
         self.channel_id = channel_id
         self.active = True
         self.chooser = chooser
+        self.starter_id = starter_id
+        self.timeout_task: Optional[asyncio.Task] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -158,15 +165,90 @@ def get_game(channel_id: int) -> Optional[Game]:
 
 def cleanup_game(channel_id: int) -> None:
     """
-    Remove a game from the active games store.
+    Remove a game from the active games store and cancel its timeout.
 
     Args:
         channel_id: The Discord channel ID whose game should be removed.
     """
-    if channel_id in active_games:
-        del active_games[channel_id]
+    game = active_games.pop(channel_id, None)
+    if game and game.timeout_task:
+        game.timeout_task.cancel()
+    if game:
         log.debug("Cleaned up game in channel {}", channel_id)
 
+
+# --------------------------------------------------------------------------- #
+#  Timeout handling
+# --------------------------------------------------------------------------- #
+
+async def _game_timeout(channel_id: int, bot: commands.Bot) -> None:
+    """
+    Wait for the configured timeout, then cancel the game if still active.
+
+    Args:
+        channel_id: The Discord channel ID of the game.
+        bot:        The bot instance (for timeout duration and channel lookup).
+    """
+    await asyncio.sleep(bot.game_timeout)
+
+    game = get_game(channel_id)
+    if not game or not game.active:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel:
+        embed = discord.Embed(
+            title="⏱️ Game Timed Out",
+            description=(
+                f"The game has been cancelled due to inactivity "
+                f"({bot.game_timeout}s with no guesses)."
+            ),
+            color=discord.Color.orange(),
+        )
+        await channel.send(embed=embed)
+
+    cleanup_game(channel_id)
+    log.info("Game timed out in channel {}", channel_id)
+
+
+def schedule_timeout(game: Game, bot: commands.Bot) -> None:
+    """
+    Schedule an inactivity timeout task for a game.
+
+    Args:
+        game: The Game instance to monitor.
+        bot:  The bot instance (for timeout duration).
+    """
+    game.timeout_task = asyncio.create_task(_game_timeout(game.channel_id, bot))
+
+
+# --------------------------------------------------------------------------- #
+#  Permission helpers
+# --------------------------------------------------------------------------- #
+
+def can_cancel(game: Game, user_id: int) -> bool:
+    """
+    Check whether a user is allowed to cancel a game.
+
+    Public: only the starter may cancel.
+    Duel:   the starter or either participant may cancel.
+    Chosen: only the picker/starter may cancel.
+
+    Args:
+        game:    The Game instance.
+        user_id: The Discord user ID attempting to cancel.
+
+    Returns:
+        True if the user may cancel the game.
+    """
+    if game.mode == "duel":
+        return user_id in game.players
+    return user_id == game.starter_id
+
+
+# --------------------------------------------------------------------------- #
+#  Message helpers
+# --------------------------------------------------------------------------- #
 
 async def announce_result(
     channel: discord.abc.Messageable,
@@ -244,11 +326,12 @@ async def _chosen_game_callback(
     max_val: int,
     target: int,
     picker_id: int,
+    bot: commands.Bot,
 ) -> None:
     """
     Callback triggered by NumberPickerModal after the picker selects a number.
 
-    Creates the game and sends the start message.
+    Creates the game, schedules its timeout, and sends the start message.
 
     Args:
         channel:   The channel where the game is hosted.
@@ -256,6 +339,7 @@ async def _chosen_game_callback(
         max_val:   Maximum of the range.
         target:    The secret number chosen by the picker.
         picker_id: User ID of the picker.
+        bot:       The bot instance (for timeout scheduling).
     """
     existing = get_game(channel.id)  # type: ignore
     if existing and existing.active:
@@ -269,9 +353,11 @@ async def _chosen_game_callback(
         max_val=max_val,
         players=[],
         channel_id=channel.id,  # type: ignore
+        starter_id=picker_id,
         chooser=picker_id,
     )
     active_games[channel.id] = game  # type: ignore
+    schedule_timeout(game, bot)
 
     embed = discord.Embed(
         title="🎮 Higher or Lower — Chosen Mode",
@@ -367,6 +453,7 @@ async def range_autocomplete(ctx: discord.AutocompleteContext) -> list[str]:
 async def _start_public_game(
     ctx: discord.ApplicationContext,
     range_name: Optional[str],
+    bot: commands.Bot,
 ) -> None:
     """
     Create and start a public game.
@@ -374,6 +461,7 @@ async def _start_public_game(
     Args:
         ctx:        The application context.
         range_name: Optional range key. Defaults to 1–100.
+        bot:        The bot instance (for timeout scheduling).
     """
     existing = get_game(ctx.channel.id)
     if existing and existing.active:
@@ -390,8 +478,10 @@ async def _start_public_game(
         max_val=max_val,
         players=[],
         channel_id=ctx.channel.id,
+        starter_id=ctx.author.id,
     )
     active_games[ctx.channel.id] = game
+    schedule_timeout(game, bot)
 
     embed = discord.Embed(
         title="🎮 Higher or Lower — Public",
@@ -425,11 +515,16 @@ class General(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         """Store bot reference and register the chosen-mode callback."""
         self.bot = bot
-        bot._chosen_game_callback = _chosen_game_callback
+        # Wrap so the callback receives the bot instance for timeout scheduling
+        async def _callback(channel, min_val, max_val, target, picker_id):
+            await _chosen_game_callback(
+                channel, min_val, max_val, target, picker_id, bot,
+            )
+        bot._chosen_game_callback = _callback
         log.info("General cog loaded")
 
     # ================================================================== #
-    #  Default behaviour — /guessthenum with no subcommand starts public
+    #  Subcommand: public
     # ================================================================== #
 
     @guessthenum.command(name="public", description="Start a public guessing game")
@@ -451,18 +546,17 @@ class General(commands.Cog):
             ctx:        The application context.
             range_name: Optional range key. Defaults to 1–100.
         """
-        await _start_public_game(ctx, range_name)
+        await _start_public_game(ctx, range_name, self.bot)
 
     # ------------------------------------------------------------------ #
     #  Subcommand: duel
     # ------------------------------------------------------------------ #
 
-    @guessthenum.command(name="duel", description="1v1 duel — two players take turns")
+    @guessthenum.command(name="duel", description="Challenge another player to a 1v1 duel")
     async def cmd_duel(
         self,
         ctx: discord.ApplicationContext,
-        player1: discord.Option(discord.Member, "First player"),
-        player2: discord.Option(discord.Member, "Second player"),
+        opponent: discord.Option(discord.Member, "The player you want to duel"),
         range_name: discord.Option(
             str,
             "Range preset name (e.g. Fun, High Test)",
@@ -472,18 +566,17 @@ class General(commands.Cog):
         ),
     ) -> None:
         """
-        Start a duel between two players.
+        Start a duel — the command invoker vs the chosen opponent.
 
         Players alternate guessing until one finds the number.
 
         Args:
-            ctx:        The application context.
-            player1:    First duellist.
-            player2:    Second duellist.
+            ctx:      The application context.
+            opponent: The player to duel against.
             range_name: Optional range key. Defaults to 1–100.
         """
-        if player1.id == player2.id:
-            await ctx.respond("You need two different players for a duel!")
+        if opponent.id == ctx.author.id:
+            await ctx.respond("You can't duel yourself!", ephemeral=True)
             return
 
         existing = get_game(ctx.channel.id)
@@ -491,36 +584,35 @@ class General(commands.Cog):
             await ctx.respond("A game is already running in this channel!", ephemeral=True)
             return
 
-        # Command invoker goes first if they're one of the two players
-        if ctx.author.id == player2.id:
-            player1, player2 = player2, player1
-
         min_val, max_val = _resolve_range(range_name)
         target = generate_secret(min_val, max_val)
 
+        # Command invoker always goes first
         game = Game(
             mode="duel",
             target=target,
             min_val=min_val,
             max_val=max_val,
-            players=[player1.id, player2.id],
+            players=[ctx.author.id, opponent.id],
             channel_id=ctx.channel.id,
+            starter_id=ctx.author.id,
         )
         active_games[ctx.channel.id] = game
+        schedule_timeout(game, self.bot)
 
         embed = discord.Embed(
             title="⚔️ Higher or Lower — Duel",
             description=(
-                f"{player1.mention} vs {player2.mention}\n"
+                f"{ctx.author.mention} vs {opponent.mention}\n"
                 f"Range: **{min_val}**–**{max_val}**\n\n"
-                f"{player1.mention} goes first! Type a number to guess."
+                f"{ctx.author.mention} goes first! Type a number to guess."
             ),
             color=discord.Color.red(),
         )
         await ctx.respond(embed=embed)
         log.info(
             "Duel started in channel {}: {} vs {}",
-            ctx.channel.id, player1.id, player2.id,
+            ctx.channel.id, ctx.author.id, opponent.id,
         )
 
     # ------------------------------------------------------------------ #
@@ -546,6 +638,11 @@ class General(commands.Cog):
             ctx:        The application context.
             range_name: Optional range key. Defaults to 1–100.
         """
+        existing = get_game(ctx.channel.id)
+        if existing and existing.active:
+            await ctx.respond("A game is already running in this channel!", ephemeral=True)
+            return
+
         min_val, max_val = _resolve_range(range_name)
 
         view = NumberPickerView(
@@ -572,12 +669,23 @@ class General(commands.Cog):
         """
         Cancel the active Higher or Lower game in this channel.
 
+        Public: only the starter may cancel.
+        Duel:   either participant may cancel.
+        Chosen: only the picker may cancel.
+
         Args:
             ctx: The application context.
         """
         game = get_game(ctx.channel.id)
         if not game or not game.active:
-            await ctx.respond("No active game in this channel to cancel.")
+            await ctx.respond("No active game in this channel to cancel.", ephemeral=True)
+            return
+
+        if not can_cancel(game, ctx.author.id):
+            await ctx.respond(
+                "Only the game starter (or a duel participant) can cancel this game.",
+                ephemeral=True,
+            )
             return
 
         cleanup_game(ctx.channel.id)

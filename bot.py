@@ -27,6 +27,9 @@ GAME_TIMEOUT = int(os.getenv("GAME_TIMEOUT", "300"))
 
 bot = discord.Bot(command_prefix="?", intents=discord.Intents.all())
 
+# Expose the game timeout so cogs can access it via bot.game_timeout
+bot.game_timeout = GAME_TIMEOUT
+
 
 @bot.event
 async def on_ready() -> None:
