@@ -55,7 +55,7 @@ class NumberPickerModal(discord.ui.Modal):
         Handle the modal submission.
 
         Validates the input, stores the chosen number, and signals
-        the general cog to start the game via a callback stored on
+        the game cog to start the game via a callback stored on
         the bot instance.
         """
         # Validate the entered number is an integer within range
@@ -82,7 +82,7 @@ class NumberPickerModal(discord.ui.Modal):
         )
 
         # Trigger the game creation callback stored on the bot
-        # This is set by the general cog's chosen command
+        # This is set by the game cog's chosen command
         callback = getattr(interaction.client, "_chosen_game_callback", None)
         if callback:
             await callback(

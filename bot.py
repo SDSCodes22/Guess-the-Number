@@ -57,7 +57,8 @@ async def ping(ctx: discord.ApplicationContext) -> None:
 def setup_hook() -> None:
     """Load all cogs during bot startup."""
     extensions = [
-        "cogs.general",
+        "cogs.game",
+        "cogs.duel",
         "cogs.admin",
         # "cogs.results" Disable the results cog
     ]

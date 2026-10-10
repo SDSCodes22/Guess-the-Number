@@ -282,7 +282,7 @@ class Admin(commands.Cog):
     async def cmd_reload(
         self,
         ctx: discord.ApplicationContext,
-        cog: discord.Option(str, "Cog module name (e.g. general, admin)"),
+        cog: discord.Option(str, "Cog module name (e.g. game, duel, admin)"),
     ) -> None:
         """
         Reload a cog by name.
